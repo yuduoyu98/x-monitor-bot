@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# === x-monitor-bot ===
+# Runtime data
+cache/
+state.db
+*.stackdump
+logs/
+
+# Sensitive config
+config.yaml
+.env
+
