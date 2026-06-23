@@ -74,28 +74,30 @@ class Scheduler:
                 await self._db.set_last_post_at(account_id, datetime.now(UTC).isoformat())
                 return
 
-            # Step 1: RSS discovery (uses published timestamps to filter by watermark)
+            # Step 1: RSS discovery
             candidates = await self._fetcher.fetch_rss_candidates(account_id, since=since)
-            if not candidates:
-                return
 
-            # Step 2: Filter out already-known IDs (DB index lookup, constant time)
-            known = await self._db.filter_known_ids(candidates)
-            new_ids = [c for c in candidates if c not in known]
-            if not new_ids:
-                return
+            # Step 2: Filter known IDs
+            if candidates:
+                known = await self._db.filter_known_ids(candidates)
+                new_ids = [c for c in candidates if c not in known]
+            else:
+                new_ids = []
 
-            # Step 3: fxTwitter resolution (expensive, only for truly new posts)
-            posts = await self._fetcher.resolve_posts(new_ids, account_id)
+            # Step 3: fxTwitter resolution
+            posts = await self._fetcher.resolve_posts(new_ids, account_id) if new_ids else []
 
-            # RSS returns newest first; send oldest first for timeline order
+            # RSS newest first → send oldest first
             for post in reversed(posts):
                 await self._process_post(post, sub)
-                await asyncio.sleep(3)  # avoid TG rate limit
+                await asyncio.sleep(3)
 
+            # Always update watermark — prevents re-polling same RSS data
             if posts:
                 newest = max(p.timestamp for p in posts)
                 await self._db.set_last_post_at(account_id, newest.isoformat())
+            else:
+                await self._db.set_last_post_at(account_id, datetime.now(UTC).isoformat())
 
         except Exception:
             logger.exception("Failed to process account @%s", account_id)

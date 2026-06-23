@@ -1,8 +1,9 @@
-"""Tests for the Telegram sender."""
+"""Tests for the Telegram sink caption building."""
 
 from datetime import UTC, datetime
+from pathlib import Path
 
-from src.fetcher.base import MediaItem, Post
+from src.source.base import MediaFile, Post
 from src.telegram_bot import _build_caption
 
 DT = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
@@ -15,7 +16,9 @@ def _make_post(text: str = "Hello world!") -> Post:
         timestamp=DT,
         text=text,
         url="https://x.com/test_user/status/123",
-        media=[MediaItem(url="https://pbs.twimg.com/x.jpg", type="photo")],
+        media=[
+            MediaFile(path=Path("/cache/x.jpg"), type="photo", url="https://pbs.twimg.com/x.jpg")
+        ],
     )
 
 

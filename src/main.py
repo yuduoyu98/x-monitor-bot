@@ -1,10 +1,16 @@
-"""Entry point for x-monitor-bot."""
+"""Entry point:wire Database + Source + Sink → SyncEngine loop。
+
+    python -m src.main
+
+需要环境变量 SCWEET_AUTH_TOKEN(专用号 cookie);config.yaml 提供 telegram/storage/scheduler。
+"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
@@ -17,68 +23,53 @@ if str(_project_root) not in sys.path:
 from src import setup_logging
 from src.config import load_config
 from src.database import Database
-from src.downloader import MediaDownloader
-from src.fetcher import create_fetcher
-from src.scheduler import Scheduler
-from src.telegram_bot import TelegramSender
+from src.source.scweet import ScweetSource
+from src.sync_engine import run_loop
+from src.telegram_bot import TelegramSink
 
 logger = logging.getLogger(__name__)
 
 
 async def main() -> None:
-    """Load config, wire up components via factory, start scheduler."""
     setup_logging()
     logger.info("x-monitor-bot starting...")
 
-    # Load config
-    try:
-        config = load_config("config.yaml")
-    except FileNotFoundError:
-        logger.error("config.yaml not found. Copy config.example.yaml to config.yaml and edit it.")
-        sys.exit(1)
-    except Exception:
-        logger.exception("Failed to load config")
+    config = load_config("config.yaml")
+    auth_token = os.environ.get("SCWEET_AUTH_TOKEN")
+    if not auth_token:
+        logger.error("SCWEET_AUTH_TOKEN env var required (专用号 auth_token cookie)")
         sys.exit(1)
 
-    # Wire up components
     db = Database(config.storage.db_path)
     await db.init()
+    source = ScweetSource(auth_token=auth_token, cache_dir=config.storage.cache_dir)
+    sink = TelegramSink(bot_token=config.telegram.bot_token, chat_id=config.telegram.chat_id)
 
-    fetcher = create_fetcher(config.fetcher)
-    sender = TelegramSender(config.telegram.bot_token)
-    downloader = MediaDownloader(
-        cache_dir=config.storage.cache_dir,
-    )
-
-    scheduler = Scheduler(
-        config=config,
-        db=db,
-        fetcher=fetcher,
-        sender=sender,
-        downloader=downloader,
-    )
-
-    # Graceful shutdown on SIGINT / SIGTERM
+    stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
     def _shutdown() -> None:
-        logger.info("Received shutdown signal, stopping...")
-        scheduler.stop()
+        logger.info("shutdown signal received")
+        stop_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, _shutdown)
 
     try:
-        await scheduler.run()
-    except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt received")
+        await run_loop(
+            db,
+            source,
+            sink,
+            loop_interval=config.scheduler.loop_interval_seconds,
+            stop_event=stop_event,
+        )
     finally:
-        logger.info("Shutting down...")
-        await fetcher.close()
-        await downloader.close()
+        logger.info("shutting down...")
+        await source.close()
+        await sink.close()
         await db.close()
-        logger.info("x-monitor-bot stopped.")
+        logger.info("stopped.")
 
 
 if __name__ == "__main__":
