@@ -96,6 +96,9 @@ async def run_tick(
     }
     sent: list[str] = []
     dead: list[str] = []
+    skipped_text = 0
+    skipped_rt = 0
+    failed_send = 0
     for post in discovered:
         entry = working.get(post.post_id)
         if entry is None:
@@ -103,22 +106,45 @@ async def run_tick(
             working[post.post_id] = entry
         if entry.settled:
             continue  # 已结算 → 跳过(不重复发)
+        ts = post.timestamp.strftime("%Y-%m-%d %H:%M")
+        snippet = (post.text or "").replace("\n", " ").strip()[:40]
+        prefix = (
+            f"[tick] {post.post_id} | {ts} | media={len(post.media)} "
+            f"rt={post.is_retweet} | {snippet}"
+        )
         if sync_mode == "media_only" and not post.media:
-            entry.status = "skipped"  # media_only 下纯文本推:不发,但算 settled(watermark 照过)
+            entry.status = "skipped"
+            skipped_text += 1
+            logger.info("%s → 跳过(文本,media_only)", prefix)
             continue
         if skip_retweets and post.is_retweet:
-            entry.status = "skipped"  # 转推默认跳过(同 settled,watermark 照过)
+            entry.status = "skipped"
+            skipped_rt += 1
+            logger.info("%s → 跳过(转推/引用)", prefix)
             continue
         try:
             await send(post)
             entry.status = "sent"
             sent.append(post.post_id)
-        except Exception:
+            logger.info("%s → 已发", prefix)
+        except Exception as exc:
             entry.status = mark_failed(entry, max_retries)
             entry.attempts += 1
+            failed_send += 1
+            logger.warning(
+                "%s → 失败(%s, attempt %d): %s", prefix, entry.status, entry.attempts, exc
+            )
             if entry.status == "dead":
                 dead.append(post.post_id)
 
+    logger.info(
+        "[tick] 统计: %d 条 → 已发=%d 跳过(文本=%d, 转推=%d) 发送失败=%d",
+        len(discovered),
+        len(sent),
+        skipped_text,
+        skipped_rt,
+        failed_send,
+    )
     new_wm = advance_watermark(list(working.values()), watermark)
     # 只淘汰"已结算 且 post_ts ≤ watermark"的(Source 不会再返回它们);
     # 已结算但在 watermark 之上(gap:下方有失败推卡住)必须留,否则被重新发现时重发 = 重复。
@@ -157,11 +183,16 @@ async def tick_account(
     now = now or datetime.now(UTC)
     watermark = await store.get_watermark(account)
     if watermark is None:
+        logger.info("[tick] @%s 首次 → watermark=now,跳过历史", account)
         await store.set_watermark(account, now)
         return TickResult(outbox=[], watermark=now, sent=[], dead=[])
 
     outbox = await store.get_outbox(account)
+    logger.info(
+        "[tick] @%s 开始 watermark=%s outbox=%d", account, watermark.isoformat(), len(outbox)
+    )
     discovered = await source.get_new_posts(account, watermark, limit=fetch_limit)
+    logger.info("[tick] @%s 发现 %d 条新推", account, len(discovered))
     result = await run_tick(
         discovered,
         outbox,
@@ -174,6 +205,13 @@ async def tick_account(
 
     await store.replace_outbox(account, result.outbox)
     await store.set_watermark(account, result.watermark)
+    logger.info(
+        "[tick] @%s 完成 sent=%d dead=%d → watermark=%s",
+        account,
+        len(result.sent),
+        len(result.dead),
+        result.watermark.isoformat(),
+    )
     ts_by_id = {p.post_id: p.timestamp for p in discovered}
     for dead_id in result.dead:
         await store.add_dead_letter(

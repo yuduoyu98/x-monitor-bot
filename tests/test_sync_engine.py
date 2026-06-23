@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import sys
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -369,30 +371,39 @@ async def test_run_once_respects_per_subscription_skip_retweets(db):
     assert sink.sent == ["RT"]  # skip_retweets=False → 转推发了
 
 
-# --- 全流程活体:ScweetSource → tick_account → TelegramSink → Database ---
-# 账号作入参(TEST_ACCOUNT);会真发到 config 里的 TG 频道。无 CLI、无 GUI,纯入参驱动。
+# --- pipeline 活体:Source → tick_account → TelegramSink → Database(会真发到 TG)---
+# 两个源各一个测试。入参(env):ACCOUNT(必传,也作 opt-in)、SYNC_MODE(默认 media_only)、
+# WATERMARK(yyyy-MM-dd HH:mm:ss,不传默认 2 天前)。Scweet 另需 SCWEET_AUTH_TOKEN。
 
 
-@pytest.mark.skipif(
-    not os.environ.get("SCWEET_AUTH_TOKEN"),
-    reason="needs SCWEET_AUTH_TOKEN + config.yaml(TG) + proxy",
-)
-async def test_full_flow_live_syncs_post_to_telegram(tmp_path):
+async def _run_pipeline(source, label: str, tmp_path):
+    """跑一次完整 tick(Source→Engine→Sink→DB),返回 (result, start_watermark)。"""
     from src.config import load_config
-    from src.source.scweet import ScweetSource
     from src.telegram_bot import TelegramSink
 
-    config = load_config("config.yaml")
-    account = os.environ.get("TEST_ACCOUNT", "chipsinblack")
-    sync_mode = os.environ.get("SYNC_MODE", "media_only")
+    # 详细日志:force=True 覆盖 pytest 的日志捕获,确保 INFO 输出到 stderr(-s 可见);
+    # Scweet 内部 bootstrap 噪音降到 WARNING。
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        stream=sys.stderr,
+        force=True,
+    )
+    logging.getLogger("Scweet").setLevel(logging.WARNING)
 
-    start = datetime.now(UTC) - timedelta(days=int(os.environ.get("WATERMARK_DAYS", "2")))
+    config = load_config("config.yaml")
+    account = os.environ["ACCOUNT"]  # gate 保证已设
+    sync_mode = os.environ.get("SYNC_MODE", "media_only")
+    wm_str = os.environ.get("WATERMARK")
+    if wm_str:
+        start = datetime.strptime(wm_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    else:
+        start = datetime.now(UTC) - timedelta(days=2)
+
     db = Database(":memory:")
     await db.init()
     await db.upsert_subscription(account)
-    await db.set_watermark(account, start)  # 回灌近 2 天用于验证
-
-    source = ScweetSource(auth_token=os.environ["SCWEET_AUTH_TOKEN"], cache_dir=tmp_path)
+    await db.set_watermark(account, start)
     sink = TelegramSink(bot_token=config.telegram.bot_token, chat_id=config.telegram.chat_id)
     try:
         result = await tick_account(db, source, sink, account, sync_mode=sync_mode)
@@ -402,8 +413,36 @@ async def test_full_flow_live_syncs_post_to_telegram(tmp_path):
         await db.close()
 
     print(
-        f"\n[full_flow] {account} mode={sync_mode} sent={result.sent} "
+        f"\n[pipeline:{label}] {account} mode={sync_mode} sent={result.sent} "
         f"dead={result.dead} wm={result.watermark.isoformat()}"
     )
-    # pipeline 跑通即可(watermark 没倒退);媒体推会落到 TG 频道(media_only 下只发媒体)。
+    return result, start
+
+
+@pytest.mark.skipif(
+    not (os.environ.get("ACCOUNT") and os.environ.get("SCWEET_AUTH_TOKEN")),
+    reason="需 ACCOUNT + SCWEET_AUTH_TOKEN + config.yaml(TG) + proxy",
+)
+async def test_pipeline_scweet(tmp_path):
+    from src.source.scweet import ScweetSource
+
+    source = ScweetSource(
+        auth_token=os.environ["SCWEET_AUTH_TOKEN"],
+        cache_dir=tmp_path,
+        db_path=tmp_path / "scweet.db",  # 独立 db:避免持久 db 里旧 eligible 账号掩盖坏 token
+    )
+    result, start = await _run_pipeline(source, "scweet", tmp_path)
+    assert result.watermark >= start
+
+
+@pytest.mark.skipif(
+    not os.environ.get("ACCOUNT"),
+    reason="需 ACCOUNT + config.yaml(TG);Nitter 无需 token",
+)
+async def test_pipeline_nitter(tmp_path):
+    from src.source.nitter import NitterSource
+
+    source = NitterSource(cache_dir=tmp_path)
+    result, start = await _run_pipeline(source, "nitter", tmp_path)
+    # Nitter 实例可能全挂 → sent 可能为空;pipeline 跑通(watermark 没倒退)即算过。
     assert result.watermark >= start

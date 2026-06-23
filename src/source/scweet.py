@@ -16,12 +16,11 @@ import httpx
 
 from src.source.base import (
     DiscoveredTweet,
-    MediaFile,
     MediaRef,
     Post,
     filter_newer,
-    media_cache_path,
 )
+from src.source.download import download_post
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +108,7 @@ class ScweetSource:
         self._db_path = db_path
         self._client = None  # Scweet 实例,懒构造(重依赖 + 首次 bootstrap 联网)
         self._http: httpx.AsyncClient | None = None  # 媒体下载用
+        self._auth_checked = False
 
     def _ensure_client(self):
         if self._client is None:
@@ -123,7 +123,7 @@ class ScweetSource:
     def _ensure_http(self) -> httpx.AsyncClient:
         if self._http is None:
             kwargs = {
-                "timeout": 60.0,
+                "timeout": 120.0,
                 "follow_redirects": True,
                 "headers": {"Referer": "https://x.com/", "User-Agent": "x-monitor-bot/0.1"},
             }
@@ -143,47 +143,41 @@ class ScweetSource:
         (内部高效翻页;低活跃账号发完即停,不过取)。连续轮询 1 次;回填 2 次(首页重取 1 次)。
         """
         client = self._ensure_client()
+        if not self._auth_checked:
+            # 坏 token 时 Scweet 静默返回空(bootstrap 失败 → 账号 unusable → 无 eligible)。
+            # 查 db 的 eligible 账号:没有 → 显式 raise,别把"认证挂了"当"没新推"。
+            # 注意:持久 db 里上一次好 token 的 eligible 账号会掩盖本次坏 token —— 换 token/测试
+            # 时应传独立 db_path 避免串。
+            if not client.db.list_accounts(eligible_only=True):
+                raise RuntimeError(
+                    "Scweet auth failed — no eligible account; check SCWEET_AUTH_TOKEN / proxy"
+                )
+            self._auth_checked = True
+            logger.info("[scweet] @%s auth ok", account)
         raw_list = await client.aget_profile_tweets([account], limit=limit)
         if watermark is not None and raw_list:
             parsed = [p for p in (parse_tweet(t) for t in raw_list) if p is not None]
             oldest = min((p.timestamp for p in parsed), default=None)
             if oldest is not None and oldest > watermark:
+                logger.info("[scweet] @%s gap 大,扩取到 max_limit=%d", account, max_limit)
                 raw_list = await client.aget_profile_tweets([account], limit=max_limit)
         discovered = [d for d in (parse_tweet(t) for t in raw_list) if d is not None]
         new = filter_newer(discovered, watermark)
+        logger.info(
+            "[scweet] @%s 取到 %d 条,%d 在 watermark 之后",
+            account,
+            len(discovered),
+            len(new),
+        )
         posts = [await self._to_post(d, account) for d in new]
-        return [p for p in posts if p is not None]
+        ok = [p for p in posts if p is not None]
+        dl_failed = len(posts) - len(ok)
+        logger.info("[scweet] @%s 下载完成: 成功 %d 条, 失败 %d 条", account, len(ok), dl_failed)
+        return ok
 
     async def _to_post(self, dt: DiscoveredTweet, account: str) -> Post | None:
-        """下载全部媒体 → Post。任一媒体下载失败 → 返回 None(整条跳过,下轮重发现重试,
-        避免半发 + 重试重复)。"""
-        http = self._ensure_http()
-        files: list[MediaFile] = []
-        for i, ref in enumerate(dt.media, 1):
-            path = media_cache_path(
-                self._cache_dir, account, dt.display_name, dt.post_id, dt.timestamp, ref.type, i
-            )
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if not path.exists():
-                try:
-                    resp = await http.get(ref.url)
-                    resp.raise_for_status()
-                    path.write_bytes(resp.content)
-                    logger.info("downloaded %s (%d bytes)", path.name, len(resp.content))
-                except Exception:
-                    logger.warning("media download failed, skip post %s: %s", dt.post_id, ref.url)
-                    return None
-            files.append(MediaFile(path=path, type=ref.type, url=ref.url))
-        return Post(
-            post_id=dt.post_id,
-            username=account,
-            timestamp=dt.timestamp,
-            text=dt.text,
-            media=files,
-            is_retweet=dt.is_retweet,
-            url=f"https://x.com/{account}/status/{dt.post_id}",
-            display_name=dt.display_name,
-        )
+        """下载全部媒体 → Post(共享 download_post)。任一媒体失败 → None。"""
+        return await download_post(dt, account, self._cache_dir, self._ensure_http())
 
     async def close(self) -> None:
         if self._http is not None:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from telegram import Bot, InputMediaPhoto, InputMediaVideo
 from telegram.constants import ParseMode
@@ -23,11 +24,12 @@ TELEGRAM_CAPTION_MAX = 1024
 
 
 class MediaTooLargeError(Exception):
-    """媒体超过 TG bot API 50MB 上限 → 整条 post 失败(重试后转 dead_letter)。"""
+    """媒体超过 TG bot API 50MB 上限 → TelegramSink 发文本降级(caption + 警告 + 链接)。"""
 
 
 def _build_caption(post: Post) -> str:
     text = post.text.replace("<", "&lt;").replace(">", "&gt;")
+    text = re.sub(r"\s*https://t\.co/\S+", "", text)  # 去掉 X 自动加的 t.co 媒体短链
     if len(text) > TELEGRAM_CAPTION_MAX:
         text = text[: TELEGRAM_CAPTION_MAX - 3] + "..."
     time_str = post.timestamp.strftime("%Y-%m-%d %H:%M UTC")
@@ -43,18 +45,40 @@ class TelegramSink:
     """发 Post 到 Telegram(media group 或纯文本)。实现 Sink 契约。"""
 
     def __init__(self, bot_token: str, chat_id: str) -> None:
-        self.bot = Bot(token=bot_token)
+        from telegram.request import HTTPXRequest
+
+        # ptb 默认 write_timeout ~15s,大视频走代理上传会超时 → 客户端报错但 TG 服务端已收到。
+        # 加大:上传(write)120s、读响应(read)60s。
+        self.bot = Bot(
+            token=bot_token,
+            request=HTTPXRequest(
+                connect_timeout=10, read_timeout=60, write_timeout=120, pool_timeout=10
+            ),
+        )
         self.chat_id = chat_id
 
     async def post(self, post: Post) -> list[int]:
         if post.media:
-            return await self._send_media_group(post)
+            try:
+                return await self._send_media_group(post)
+            except MediaTooLargeError as e:
+                logger.warning("post %s 媒体>50MB,发文本降级: %s", post.post_id, e)
+                return await self._send_text_fallback(post)
         if post.text:
             msg = await self.bot.send_message(
                 chat_id=self.chat_id, text=_build_caption(post), parse_mode=ParseMode.HTML
             )
             return [msg.message_id]
-        return []  # 无媒体无文本 → 无可发(不算失败)
+        return []
+
+    async def _send_text_fallback(self, post: Post) -> list[int]:
+        """媒体>50MB(TG 发不了)→ 发文本:caption + ⚠️ 警告 + 原链接。标为已发,不重试。"""
+        text = _build_caption(post) + "\n\n⚠️ 媒体文件过大(>50MB),请点击原链接查看 👆"
+        msg = await self.bot.send_message(
+            chat_id=self.chat_id, text=text, parse_mode=ParseMode.HTML
+        )
+        logger.info("sent text fallback (media>50MB) for %s", post.post_id)
+        return [msg.message_id]
 
     async def _send_media_group(self, post: Post) -> list[int]:
         # 任一文件 >50MB → raise(不静默丢;SyncEngine 会重试/转 dead)

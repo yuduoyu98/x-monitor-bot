@@ -164,3 +164,23 @@ async def test_scweet_source_live_returns_posts_with_downloaded_media(tmp_path):
     for f in (f for p in media_posts for f in p.media):
         assert f.path.exists(), f"{f.path} not downloaded"
         assert f.path.stat().st_size > 0
+
+
+@pytest.mark.skipif(not os.environ.get("NITTER_LIVE"), reason="opt-in: NITTER_LIVE=1")
+async def test_nitter_source_live(tmp_path):
+    """NitterSource 活体:Nitter RSS + fxTwitter。实例可能挂 → 不强断言非空,跑通即可。"""
+    from src.source.nitter import NitterSource
+
+    src = NitterSource(cache_dir=tmp_path)
+    try:
+        posts = await src.get_new_posts("chipsinblack", watermark=None, limit=5)
+    finally:
+        await src.close()
+
+    print(f"\n[nitter] {len(posts)} posts(实例状态见 warning 日志)")
+    if posts:
+        timestamps = [p.timestamp for p in posts]
+        assert timestamps == sorted(timestamps, reverse=True)
+        for p in posts:
+            for f in p.media:
+                assert f.path.exists()
