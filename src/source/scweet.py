@@ -155,17 +155,36 @@ class ScweetSource:
             self._auth_checked = True
             logger.info("[scweet] @%s auth ok", account)
         raw_list = await client.aget_profile_tweets([account], limit=limit)
+        logger.info("[scweet] @%s 首次取 limit=%d → 返回 %d 条", account, limit, len(raw_list))
         if watermark is not None and raw_list:
             parsed = [p for p in (parse_tweet(t) for t in raw_list) if p is not None]
             oldest = min((p.timestamp for p in parsed), default=None)
             if oldest is not None and oldest > watermark:
-                logger.info("[scweet] @%s gap 大,扩取到 max_limit=%d", account, max_limit)
-                raw_list = await client.aget_profile_tweets([account], limit=max_limit)
+                logger.info(
+                    "[scweet] @%s gap 大(最老 %s > 水位线 %s)→ 扩取 limit=%d",
+                    account,
+                    oldest.isoformat(),
+                    watermark.isoformat(),
+                    max_limit,
+                )
+                expanded = await client.aget_profile_tweets([account], limit=max_limit)
+                logger.info(
+                    "[scweet] @%s 扩取 limit=%d → 返回 %d 条", account, max_limit, len(expanded)
+                )
+                if expanded:
+                    raw_list = expanded
+                else:
+                    logger.warning(
+                        "[scweet] @%s 扩取返回空(疑似限流),沿用首次取到的 %d 条",
+                        account,
+                        len(raw_list),
+                    )
         discovered = [d for d in (parse_tweet(t) for t in raw_list) if d is not None]
         new = filter_newer(discovered, watermark)
         logger.info(
-            "[scweet] @%s 取到 %d 条,%d 在 watermark 之后",
+            "[scweet] @%s 原始 %d 条 → 解析 %d 条 → %d 在 watermark 之后",
             account,
+            len(raw_list),
             len(discovered),
             len(new),
         )

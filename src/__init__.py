@@ -2,6 +2,9 @@
 
 import logging
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+CN_TZ = ZoneInfo("Asia/Shanghai")  # 北京时间(东八区):GUI/Sink 时间显示用
 
 
 def setup_logging(level: int = logging.INFO) -> None:

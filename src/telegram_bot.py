@@ -14,6 +14,7 @@ from telegram import Bot, InputMediaPhoto, InputMediaVideo
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError
 
+from src import CN_TZ
 from src.source.base import MediaFile, Post
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ def _build_caption(post: Post) -> str:
     text = re.sub(r"\s*https://t\.co/\S+", "", text)  # 去掉 X 自动加的 t.co 媒体短链
     if len(text) > TELEGRAM_CAPTION_MAX:
         text = text[: TELEGRAM_CAPTION_MAX - 3] + "..."
-    time_str = post.timestamp.strftime("%Y-%m-%d %H:%M UTC")
+    time_str = post.timestamp.astimezone(CN_TZ).strftime("%Y-%m-%d %H:%M")
     author = f"#{post.display_name} #{post.username}" if post.display_name else f"#{post.username}"
     return f"📅 {time_str}\n💬 {text}\n\n🆔 {author}\n🔗 {post.url}"
 

@@ -1,11 +1,12 @@
-"""SQLite 持久层(SP2):subscriptions / outbox / dead_letter。
+"""SQLite 持久层:subscriptions / outbox / dead_letter / groups。
 
-替代旧 posts 表 + sync_log(全量历史)→ 轻量的 watermark 游标 + 有界 outbox。
 watermark 是 subscription 的一列;outbox 只存"未结算 + 已结算但在 watermark 之上"的推。
+groups 支持订阅分组,每组有总开关(关了 → 组内订阅不轮询)。
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,12 +24,18 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     sync_mode TEXT NOT NULL DEFAULT 'media_only',
     watermark TEXT,
     remark TEXT NOT NULL DEFAULT '',
-    poll_interval INTEGER NOT NULL DEFAULT 300,
-    fetch_limit INTEGER NOT NULL DEFAULT 20,
+    poll_interval INTEGER NOT NULL DEFAULT 86400,
+    fetch_limit INTEGER NOT NULL DEFAULT 5,
     skip_retweets INTEGER NOT NULL DEFAULT 1,
+    group_name TEXT,
     last_polled TEXT,
     running INTEGER NOT NULL DEFAULT 0,
     running_since TEXT
+);
+CREATE TABLE IF NOT EXISTS groups (
+    name TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    sort_order INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS outbox (
     account_id TEXT NOT NULL,
@@ -63,6 +70,9 @@ class Database:
         self._conn = await aiosqlite.connect(str(self._db_path))
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA_SQL)
+        # 迁移:旧 DB 可能没有 group_name 列
+        with contextlib.suppress(Exception):
+            await self._conn.execute("ALTER TABLE subscriptions ADD COLUMN group_name TEXT")
         await self._conn.commit()
         logger.info("Database initialized at %s", self._db_path)
 
@@ -79,20 +89,30 @@ class Database:
         *,
         sync_mode: str = "media_only",
         remark: str = "",
-        poll_interval: int = 300,
-        fetch_limit: int = 20,
+        poll_interval: int = 86400,
+        fetch_limit: int = 5,
         skip_retweets: bool = True,
+        group_name: str | None = None,
     ) -> None:
         """插入或更新订阅配置。ON CONFLICT 只改配置列,保留 watermark/last_polled/running。"""
         await self._conn.execute(
             "INSERT INTO subscriptions "
-            "(account_id, sync_mode, remark, poll_interval, fetch_limit, skip_retweets) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
+            "(account_id, sync_mode, remark, poll_interval, "
+            "fetch_limit, skip_retweets, group_name) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(account_id) DO UPDATE SET "
             "sync_mode=excluded.sync_mode, remark=excluded.remark, "
             "poll_interval=excluded.poll_interval, fetch_limit=excluded.fetch_limit, "
-            "skip_retweets=excluded.skip_retweets",
-            (account_id, sync_mode, remark, poll_interval, fetch_limit, int(skip_retweets)),
+            "skip_retweets=excluded.skip_retweets, group_name=excluded.group_name",
+            (
+                account_id,
+                sync_mode,
+                remark,
+                poll_interval,
+                fetch_limit,
+                int(skip_retweets),
+                group_name,
+            ),
         )
         await self._conn.commit()
 
@@ -102,6 +122,56 @@ class Database:
 
     async def delete_subscription(self, account_id: str) -> None:
         await self._conn.execute("DELETE FROM subscriptions WHERE account_id = ?", (account_id,))
+        await self._conn.commit()
+
+    async def toggle_enabled(self, account_id: str) -> bool:
+        """翻转订阅 enabled,返回新状态。"""
+        await self._conn.execute(
+            "UPDATE subscriptions SET enabled = 1 - enabled WHERE account_id = ?",
+            (account_id,),
+        )
+        await self._conn.commit()
+        cursor = await self._conn.execute(
+            "SELECT enabled FROM subscriptions WHERE account_id = ?", (account_id,)
+        )
+        row = await cursor.fetchone()
+        return bool(row[0]) if row else False
+
+    # --- groups ---
+
+    async def upsert_group(self, name: str, sort_order: int = 0) -> None:
+        await self._conn.execute(
+            "INSERT INTO groups (name, sort_order) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET sort_order=excluded.sort_order",
+            (name, sort_order),
+        )
+        await self._conn.commit()
+
+    async def get_groups(self) -> list[dict]:
+        cursor = await self._conn.execute("SELECT * FROM groups ORDER BY sort_order, name")
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def toggle_group(self, name: str) -> bool:
+        """翻转组开关,返回新状态。"""
+        await self._conn.execute("UPDATE groups SET enabled = 1 - enabled WHERE name = ?", (name,))
+        await self._conn.commit()
+        cursor = await self._conn.execute("SELECT enabled FROM groups WHERE name = ?", (name,))
+        row = await cursor.fetchone()
+        return bool(row[0]) if row else False
+
+    async def delete_group(self, name: str) -> None:
+        """删组;组内订阅的 group_name 置 NULL(变未分组)。"""
+        await self._conn.execute(
+            "UPDATE subscriptions SET group_name = NULL WHERE group_name = ?", (name,)
+        )
+        await self._conn.execute("DELETE FROM groups WHERE name = ?", (name,))
+        await self._conn.commit()
+
+    async def rename_group(self, old: str, new: str) -> None:
+        await self._conn.execute("UPDATE groups SET name = ? WHERE name = ?", (new, old))
+        await self._conn.execute(
+            "UPDATE subscriptions SET group_name = ? WHERE group_name = ?", (new, old)
+        )
         await self._conn.commit()
 
     # --- watermark ---
@@ -141,7 +211,7 @@ class Database:
         ]
 
     async def replace_outbox(self, account_id: str, entries: list[OutboxEntry]) -> None:
-        """全量替换某账号的 outbox(run_tick 产出裁剪后的新列表,直接覆盖)。"""
+        """全量替换某账号的 outbox(run_collect 产出裁剪后的新列表,直接覆盖)。"""
         now = datetime.now(UTC).isoformat()
         await self._conn.execute("DELETE FROM outbox WHERE account_id = ?", (account_id,))
         if entries:
@@ -177,7 +247,12 @@ class Database:
     # --- 调度(SP2-d)---
 
     async def get_enabled_subscriptions(self) -> list[dict]:
-        cursor = await self._conn.execute("SELECT * FROM subscriptions WHERE enabled = 1")
+        """返回个人 enabled=1 且(无组 或 组 enabled=1)的订阅。"""
+        cursor = await self._conn.execute(
+            "SELECT s.* FROM subscriptions s "
+            "LEFT JOIN groups g ON s.group_name = g.name "
+            "WHERE s.enabled = 1 AND (s.group_name IS NULL OR g.enabled = 1)"
+        )
         return [dict(row) for row in await cursor.fetchall()]
 
     async def set_last_polled(self, account_id: str, ts: datetime) -> None:

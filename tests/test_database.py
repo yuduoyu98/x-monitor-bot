@@ -67,3 +67,42 @@ async def test_dead_letter_add_and_list(db):
     assert len(dl) == 1
     assert dl[0]["post_id"] == "p1"
     assert dl[0]["reason"] == "send failed 3x"
+
+
+# --- groups ---
+
+
+async def test_group_roundtrip(db):
+    await db.upsert_group("游戏")
+    groups = await db.get_groups()
+    assert len(groups) == 1
+    assert groups[0]["name"] == "游戏"
+    assert groups[0]["enabled"] == 1
+
+
+async def test_toggle_group(db):
+    await db.upsert_group("游戏")
+    assert await db.toggle_group("游戏") is False  # 1→0
+    assert await db.toggle_group("游戏") is True  # 0→1
+
+
+async def test_delete_group_nulls_subscriptions(db):
+    await db.upsert_group("游戏")
+    await db.upsert_subscription("alice", group_name="游戏")
+    await db.delete_group("游戏")
+    subs = await db.get_subscriptions()
+    assert subs[0]["group_name"] is None
+
+
+async def test_get_enabled_subscriptions_filters_disabled_group(db):
+    """组关了 → 组内订阅不被 get_enabled_subscriptions 返回(即使个人 enabled=1)。"""
+    await db.upsert_group("游戏")
+    await db.upsert_subscription("alice", group_name="游戏")
+    await db.upsert_subscription("bob")  # 无组
+
+    enabled = await db.get_enabled_subscriptions()
+    assert {s["account_id"] for s in enabled} == {"alice", "bob"}
+
+    await db.toggle_group("游戏")  # 关组
+    enabled = await db.get_enabled_subscriptions()
+    assert {s["account_id"] for s in enabled} == {"bob"}

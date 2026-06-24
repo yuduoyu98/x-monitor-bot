@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import signal
 import sys
 from pathlib import Path
@@ -23,7 +22,7 @@ if str(_project_root) not in sys.path:
 from src import setup_logging
 from src.config import load_config
 from src.database import Database
-from src.source.scweet import ScweetSource
+from src.source.factory import make_source
 from src.sync_engine import run_loop
 from src.telegram_bot import TelegramSink
 
@@ -35,14 +34,16 @@ async def main() -> None:
     logger.info("x-monitor-bot starting...")
 
     config = load_config("config.yaml")
-    auth_token = os.environ.get("SCWEET_AUTH_TOKEN")
-    if not auth_token:
-        logger.error("SCWEET_AUTH_TOKEN env var required (专用号 auth_token cookie)")
-        sys.exit(1)
 
     db = Database(config.storage.db_path)
     await db.init()
-    source = ScweetSource(auth_token=auth_token, cache_dir=config.storage.cache_dir)
+
+    try:
+        source = make_source(config)
+    except RuntimeError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
+
     sink = TelegramSink(bot_token=config.telegram.bot_token, chat_id=config.telegram.chat_id)
 
     stop_event = asyncio.Event()

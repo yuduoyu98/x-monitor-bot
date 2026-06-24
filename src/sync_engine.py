@@ -1,7 +1,7 @@
 """SyncEngine:状态模型 + 调度(SP2)。
 
 watermark + outbox + dead_letter 三件套(替代旧 posts 表 + sync_log)。
-本模块先放纯逻辑(advance_watermark / 重试决策),tick 与循环随后补。
+纯逻辑(advance_watermark / 重试决策)+ 单账号采集(collect_account)+ 调度循环(run_once/run_loop)。
 """
 
 from __future__ import annotations
@@ -68,8 +68,8 @@ def should_poll(last_polled: datetime | None, poll_interval: int, *, now: dateti
 
 
 @dataclass
-class TickResult:
-    """一次 tick 的结果。"""
+class CollectResult:
+    """一次采集的结果。"""
 
     outbox: list[OutboxEntry]  # 剩余 in-flight(未结算 + 已结算但在 watermark 之上)
     watermark: datetime
@@ -77,7 +77,7 @@ class TickResult:
     dead: list[str]  # 本次转为 dead 的 post_id(写 dead_letter)
 
 
-async def run_tick(
+async def run_collect(
     discovered: list[Post],
     outbox: list[OutboxEntry],
     watermark: datetime,
@@ -86,7 +86,7 @@ async def run_tick(
     max_retries: int = 3,
     sync_mode: str = "all",
     skip_retweets: bool = True,
-) -> TickResult:
+) -> CollectResult:
     """处理一次采集:发现的新推进 outbox → 发 Sink → 更新状态 → 推进 watermark。
 
     send 抛异常视为该条失败(下轮重试,达上限转 dead)。
@@ -99,7 +99,7 @@ async def run_tick(
     skipped_text = 0
     skipped_rt = 0
     failed_send = 0
-    for post in discovered:
+    for post in sorted(discovered, key=lambda p: p.timestamp):  # 按发帖时间从早到晚发送
         entry = working.get(post.post_id)
         if entry is None:
             entry = OutboxEntry(post_id=post.post_id, post_ts=post.timestamp, status="pending")
@@ -109,7 +109,7 @@ async def run_tick(
         ts = post.timestamp.strftime("%Y-%m-%d %H:%M")
         snippet = (post.text or "").replace("\n", " ").strip()[:40]
         prefix = (
-            f"[tick] {post.post_id} | {ts} | media={len(post.media)} "
+            f"[collect] {post.post_id} | {ts} | media={len(post.media)} "
             f"rt={post.is_retweet} | {snippet}"
         )
         if sync_mode == "media_only" and not post.media:
@@ -138,7 +138,7 @@ async def run_tick(
                 dead.append(post.post_id)
 
     logger.info(
-        "[tick] 统计: %d 条 → 已发=%d 跳过(文本=%d, 转推=%d) 发送失败=%d",
+        "[collect] 统计: %d 条 → 已发=%d 跳过(文本=%d, 转推=%d) 发送失败=%d",
         len(discovered),
         len(sent),
         skipped_text,
@@ -149,11 +149,11 @@ async def run_tick(
     # 只淘汰"已结算 且 post_ts ≤ watermark"的(Source 不会再返回它们);
     # 已结算但在 watermark 之上(gap:下方有失败推卡住)必须留,否则被重新发现时重发 = 重复。
     pruned = [e for e in working.values() if not e.settled or e.post_ts > new_wm]
-    return TickResult(outbox=pruned, watermark=new_wm, sent=sent, dead=dead)
+    return CollectResult(outbox=pruned, watermark=new_wm, sent=sent, dead=dead)
 
 
 class SyncStore(Protocol):
-    """tick_account 依赖的持久层接口(Database 实现它;避免 sync_engine 反向依赖 database)。"""
+    """collect_account 依赖的持久层接口(Database 实现它;避免 sync_engine 反向依赖 database)。"""
 
     async def get_watermark(self, account_id: str) -> datetime | None: ...
     async def set_watermark(self, account_id: str, watermark: datetime | None) -> None: ...
@@ -164,7 +164,7 @@ class SyncStore(Protocol):
     ) -> None: ...
 
 
-async def tick_account(
+async def collect_account(
     store: SyncStore,
     source: Source,
     sink: Sink,
@@ -175,25 +175,25 @@ async def tick_account(
     sync_mode: str = "all",
     skip_retweets: bool = True,
     fetch_limit: int = 20,
-) -> TickResult:
-    """单个账号一次 tick:读状态 → Source 取推 → run_tick → 写回(outbox/watermark/dead_letter)。
+) -> CollectResult:
+    """单个账号一次采集:读状态 → Source 取推 → run_collect → 写回(outbox/watermark/dead_letter)。
 
-    watermark=None(首次)→ 设成 now 跳过历史,不处理。
+    watermark=None(首次)→ 设成 now 跳过历史,不处理。(GUI 新增订阅时已把水位线设成当前时间。)
     """
     now = now or datetime.now(UTC)
     watermark = await store.get_watermark(account)
     if watermark is None:
-        logger.info("[tick] @%s 首次 → watermark=now,跳过历史", account)
+        logger.info("[collect] @%s 首次 → watermark=now,跳过历史", account)
         await store.set_watermark(account, now)
-        return TickResult(outbox=[], watermark=now, sent=[], dead=[])
+        return CollectResult(outbox=[], watermark=now, sent=[], dead=[])
 
     outbox = await store.get_outbox(account)
     logger.info(
-        "[tick] @%s 开始 watermark=%s outbox=%d", account, watermark.isoformat(), len(outbox)
+        "[collect] @%s 开始 watermark=%s outbox=%d", account, watermark.isoformat(), len(outbox)
     )
     discovered = await source.get_new_posts(account, watermark, limit=fetch_limit)
-    logger.info("[tick] @%s 发现 %d 条新推", account, len(discovered))
-    result = await run_tick(
+    logger.info("[collect] @%s 发现 %d 条新推", account, len(discovered))
+    result = await run_collect(
         discovered,
         outbox,
         watermark,
@@ -206,7 +206,7 @@ async def tick_account(
     await store.replace_outbox(account, result.outbox)
     await store.set_watermark(account, result.watermark)
     logger.info(
-        "[tick] @%s 完成 sent=%d dead=%d → watermark=%s",
+        "[collect] @%s 完成 sent=%d dead=%d → watermark=%s",
         account,
         len(result.sent),
         len(result.dead),
@@ -249,9 +249,11 @@ async def run_once(
     now: datetime | None = None,
     max_retries: int = 3,
 ) -> None:
-    """调度循环的一轮:遍历启用的订阅,按 poll_interval 门控 + running 防并发,逐个 tick。"""
+    """调度循环的一轮:遍历启用的订阅,按 poll_interval 门控 + running 防并发,逐个采集。"""
     now = now or datetime.now(UTC)
-    for sub in await store.get_enabled_subscriptions():
+    subs = await store.get_enabled_subscriptions()
+    polled = 0
+    for sub in subs:
         account = sub["account_id"]
         if not should_poll(
             _parse_ts(sub.get("last_polled")), sub.get("poll_interval", 300), now=now
@@ -261,7 +263,7 @@ async def run_once(
             continue  # 别的执行者正在处理(手动 Run 等)→ 跳过,避免并发重复
         await store.set_running(account, True, now)
         try:
-            await tick_account(
+            await collect_account(
                 store,
                 source,
                 sink,
@@ -273,10 +275,12 @@ async def run_once(
                 skip_retweets=bool(sub.get("skip_retweets", 1)),
             )
             await store.set_last_polled(account, now)
+            polled += 1
         except Exception:
-            logger.exception("tick failed for @%s", account)
+            logger.exception("collect failed for @%s", account)
         finally:
             await store.set_running(account, False)
+    logger.info("[loop] 本轮完成:%d 启用,%d 到期采集", len(subs), polled)
 
 
 async def run_loop(
