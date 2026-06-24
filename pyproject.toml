@@ -28,6 +28,8 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/main.py" = ["E402"]
+"src/admin_gui.py" = ["E402"]
+"scripts/probe_scweet.py" = ["E402"]
 
 [tool.ruff.format]
 quote-style = "double"

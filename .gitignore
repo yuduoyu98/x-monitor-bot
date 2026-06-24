@@ -20,6 +20,11 @@ tests/media/
 
 # Scweet (stores auth_token cookie — never commit)
 scweet_state.db
+probe_scweet.db
+
+# SQLite WAL sidecar files
+*.db-shm
+*.db-wal
 outputs/
 
 # Config (contains secrets)

@@ -1,0 +1,27 @@
+# x-monitor-bot 配置模板。
+# 用法:cp config.example.yaml config.yaml,再填入实际值。
+#   config.yaml 含密钥(bot_token / auth_token),已被 .gitignore 忽略,绝不提交。
+# 订阅不在这里管理 —— 用 `python -m src.admin_gui` 编辑(存进 state.db)。
+
+telegram:
+  bot_token: ""        # @BotFather 创建的 Bot Token
+  chat_id: ""          # 目标频道/群组 ID(频道发条消息 → 转发给 @getidsbot 查询)
+
+# 数据源:scweet = X GraphQL(主,需下方 cookie + 代理);nitter = Nitter RSS(降级,无需登录)
+source_type: scweet
+
+scweet:
+  auth_token: ""       # 专用 X 账号的 auth_token cookie(或用 env SCWEET_AUTH_TOKEN,绝不进 git)
+  proxy: "http://127.0.0.1:7890"  # 国内必须:curl_cffi 不继承系统代理,需显式传(如 Clash)
+
+fetcher:
+  type: nitter_fxtwitter
+  nitter_instance: "https://nitter.net"  # source_type=nitter 时用;实例不稳定可换
+
+storage:
+  cache_dir: "./cache"
+  db_path: "./state.db"
+  cache_ttl_days: 7      # 媒体 cache 保留天数;-1 = 永不清理
+
+scheduler:
+  loop_interval_seconds: 300  # 主循环粒度(秒);每账号的实际间隔在订阅里单独配

@@ -21,6 +21,13 @@ class FetcherConfig(BaseModel):
     nitter_instance: str = "https://nitter.net"
 
 
+class ScweetConfig(BaseModel):
+    """Scweet (X GraphQL) source settings."""
+
+    auth_token: str = ""
+    proxy: str = ""
+
+
 class StorageConfig(BaseModel):
     """Local storage settings."""
 
@@ -38,12 +45,14 @@ class SchedulerConfig(BaseModel):
 class AppConfig(BaseModel):
     """Top-level application configuration (connections only, no subscriptions)."""
 
-    model_config = {"extra": "ignore"}  # ignore old subscriptions field if present
+    model_config = {"extra": "ignore"}
 
     telegram: TelegramConfig
     fetcher: FetcherConfig = FetcherConfig()
+    scweet: ScweetConfig = ScweetConfig()
     storage: StorageConfig = StorageConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
+    source_type: Literal["scweet", "nitter"] = "scweet"
 
 
 def load_config(path: str | Path = "config.yaml") -> AppConfig:
@@ -52,7 +61,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     if not config_path.exists():
         raise FileNotFoundError(
             f"Config file not found: {config_path}\n"
-            f"Copy config.example.yaml to config.yaml and fill in your settings."
+            f"复制 config.example.yaml → config.yaml 并填入实际值(结构见该模板)。"
         )
     with open(config_path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
@@ -65,8 +74,10 @@ def save_config(config: AppConfig, path: str | Path = "config.yaml") -> None:
     ordered = {
         "telegram": data.pop("telegram", {}),
         "fetcher": data.pop("fetcher", {}),
+        "scweet": data.pop("scweet", {}),
         "storage": data.pop("storage", {}),
         "scheduler": data.pop("scheduler", {}),
+        "source_type": data.pop("source_type", "scweet"),
     }
     config_path = Path(path)
     config_path.parent.mkdir(parents=True, exist_ok=True)
