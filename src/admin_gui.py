@@ -91,7 +91,13 @@ def _style_tree(tree: ttk.Treeview) -> None:
     f = Font(font="TkDefaultFont")
     f.configure(size=10)
     tree.tag_configure("group", font=(f.cget("family"), 10, "bold"))
+    tree.tag_configure("subgroup", font=(f.cget("family"), 10))  # 小组不加粗
     tree.tag_configure("off", foreground="#999")
+
+
+def _is_group(tags: tuple) -> bool:
+    """是否分组节点(顶级 group 或小组 subgroup)。"""
+    return "group" in tags or "subgroup" in tags
 
 
 class _TkLogHandler(logging.Handler):
@@ -952,7 +958,7 @@ class AdminApp:
                     text=f"{sgmark} {sgname} ({len(sg_subs)})",
                     values=("", "", "", "开" if sgenabled else "关"),
                     open=True,
-                    tags=("group",) + sgtags,
+                    tags=("subgroup",) + sgtags,
                 )
                 for s in sg_subs:
                     self._insert_sub(sg_node, s, group_enabled=genabled and sgenabled)
@@ -1038,7 +1044,7 @@ class AdminApp:
         sel = self.tree.selection()
         if not sel:
             return
-        if "group" in self.tree.item(sel[0], "tags"):
+        if _is_group(self.tree.item(sel[0], "tags")):
             self._toggle_group()
         else:
             self._edit_sub()
@@ -1052,14 +1058,14 @@ class AdminApp:
             self.tree.selection_clear()
             self.tree.selection_set(item)
             sel = self.tree.selection()
-        if "group" in self.tree.item(item, "tags"):
+        if _is_group(self.tree.item(item, "tags")):
             if self._selected_group_name() is None:
                 return  # 未分组:不是真实分组,无右键菜单
             self._setup_group_ctx(item)  # 顶级分组才开「添加小组」
             self._group_ctx.tk_popup(event.x_root, event.y_root)
             return
         # 账号:多选 → 批量菜单;单选 → 单个菜单
-        accounts = [s for s in sel if "group" not in self.tree.item(s, "tags")]
+        accounts = [s for s in sel if not _is_group(self.tree.item(s, "tags"))]
         if len(accounts) > 1:
             self._rebuild_bulk_move_menu(accounts)
             self._bulk_ctx.tk_popup(event.x_root, event.y_root)
@@ -1135,7 +1141,7 @@ class AdminApp:
         self._refresh()
 
     def _bulk_new_subgroup(self) -> None:
-        accounts = [s for s in self.tree.selection() if "group" not in self.tree.item(s, "tags")]
+        accounts = [s for s in self.tree.selection() if not _is_group(self.tree.item(s, "tags"))]
         if len(accounts) < 2:
             return
         groups = _db_call(self._db.get_groups())
@@ -1385,7 +1391,7 @@ class AdminApp:
     def _selected_group_name(self) -> str | None:
         """当前选中的分组名(顶级或小组);未分组 / 订阅节点 → None。"""
         sel = self.tree.selection()
-        if not sel or "group" not in self.tree.item(sel[0], "tags"):
+        if not sel or not _is_group(self.tree.item(sel[0], "tags")):
             return None
         name = self.tree.item(sel[0], "text")[2:].rsplit(" (", 1)[0]
         return None if name == "未分组" else name
