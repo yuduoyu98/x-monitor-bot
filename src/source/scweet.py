@@ -118,6 +118,14 @@ class ScweetSource:
             if self._proxy:
                 kwargs["proxy"] = self._proxy
             self._client = Scweet(**kwargs)
+            # 禁用 X-Client-Transaction-Id 反爬头生成:x_client_transaction 的正则跟不上
+            # X 首页改版,bootstrap 每次必崩(崩前已白打一次 GET https://x.com 首页 +
+            # 刷 warning),且失败不缓存 → 每翻一页重试一次(500 回填 ≈ 25 次)。
+            # 实测 X 对带 cookie 的 GraphQL 不强制此头(status 200 正常),禁用后功能
+            # 等价(本来就没发成功),只是不再反复失败。要重新启用删此段即可。
+            provider = getattr(self._client, "_transaction_id_provider", None)
+            if provider is not None:
+                provider.enabled = False
         return self._client
 
     def _ensure_http(self) -> httpx.AsyncClient:

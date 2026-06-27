@@ -90,3 +90,4 @@ ruff format . && ruff check .
 - **Source 打包下载**:契约只管 WHAT(Post 带文件),HOW 看方案,不强行拆 discovery/下载。
 - **per-account `poll_interval`**:管理 Scweet 每日抓取预算(每次 poll 都计费)。
 - **首次默认 watermark=now**(不回灌刷屏);GUI 可直接改 `watermark` → 改过去即从该点回灌/重采(新增订阅默认填当前时间)。
+- **禁用 `X-Client-Transaction-Id` 生成**(`ScweetSource._ensure_client` 构造 client 后设 `_transaction_id_provider.enabled=False`):该头是 X 网页客户端的真实反爬头、Scweet 默认就开(**非本项目引入**)。靠 `x_client_transaction` 逆向 X 首页的 ondemand.js 算出。**已实测确认**(走代理实跑 `GET x.com`):X 改了前端打包,首页不再内嵌旧的 webpack chunk 映射 → 库正则 `.search()` 返回 `None` → `.group()` 崩 → bootstrap 每次失败;且失败不缓存(`generate()` 见 `_client_transaction is None` 即重试)→ **每个请求白打一次 x.com 首页 + 刷一条 warning**(设计本意是缓存 15 分钟、约 15 分钟访问一次)。**X 当前不强制此头**(带 cookie 的 GraphQL 实测一直 200),故禁用功能等价、无回退。**潜伏风险(低概率高影响)**:若 X 某天强制此头 → 全账号静默取不到推且不报错;届时删 `_ensure_client` 那段重启用 + 换能匹配新版 X 的 `x_client_transaction`(当前 venv 里这份是无 dist-info 的旧副本,PyPI 404,无人维护)。与订阅分组无关(采集路径不看 group)。
