@@ -18,6 +18,7 @@ import httpx
 
 from src.source.base import DiscoveredTweet, MediaRef, Post, filter_newer
 from src.source.download import download_post
+from src.source.fxtwitter import parse_fxtwitter_tweet
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,6 @@ _NITTER_INSTANCES = [
     "https://nitter.privacydev.net",
 ]
 _FXTWITTER_API = "https://api.fxtwitter.com"
-_HAS_MEDIA_RE = re.compile(r"<img|<video", re.IGNORECASE)
 _RETWEET_RE = re.compile(r"^(RT\s|♻️|🔁)", re.IGNORECASE)
 _ID_FROM_URL_RE = re.compile(r"/status/(\d+)")
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -119,46 +119,36 @@ class NitterSource:
         if published is None:
             published = datetime.now(UTC)
         title = entry.get("title", "") or ""
-        summary = entry.get("summary", "") or ""
         is_rt = bool(_RETWEET_RE.search(title))
-        has_media = bool(_HAS_MEDIA_RE.search(summary))
-        # 转推不发(下游 skip_retweets 会跳)→ 不浪费 fxTwitter 调用
-        media = await self._resolve_fxtwitter(http, account, tid) if has_media and not is_rt else []
+        # 非转推:fxTwitter 取媒体 + display_name(转推下游会跳,不必取)
+        media: list[MediaRef] = []
+        display_name = ""
+        if not is_rt:
+            media, display_name = await self._resolve_fxtwitter(http, account, tid)
         return DiscoveredTweet(
             post_id=tid,
             timestamp=published,
             text=_TAG_RE.sub(" ", title).strip(),
             is_retweet=is_rt,
+            display_name=display_name,
             media=media,
         )
 
     async def _resolve_fxtwitter(
         self, http: httpx.AsyncClient, account: str, tweet_id: str
-    ) -> list[MediaRef]:
+    ) -> tuple[list[MediaRef], str]:
+        """fxTwitter 取媒体 + 作者 display_name;失败/无 → ([], "")。"""
         try:
             resp = await http.get(f"{_FXTWITTER_API}/{account}/status/{tweet_id}")
             resp.raise_for_status()
             data = resp.json()
         except Exception:
             logger.debug("fxTwitter failed for %s", tweet_id)
-            return []
-        media_data = (data.get("tweet") or {}).get("media") or {}
-        out: list[MediaRef] = []
-        for photo in media_data.get("photos", []):
-            url = photo.get("url", "")
-            if url:
-                if "pbs.twimg.com" in url and "?name=" not in url:
-                    url += "?name=orig"
-                out.append(MediaRef(url=url, type="photo"))
-        for video in media_data.get("videos", []):
-            url = video.get("url", "")
-            if url:
-                out.append(MediaRef(url=url, type="video"))
-        for gif in media_data.get("gifs", []):
-            url = gif.get("url", "")
-            if url:
-                out.append(MediaRef(url=url, type="animated_gif"))
-        return out
+            return [], ""
+        ft = parse_fxtwitter_tweet(data)
+        if ft is None:
+            return [], ""
+        return ft.media, ft.display_name
 
     async def close(self) -> None:
         if self._http is not None:
