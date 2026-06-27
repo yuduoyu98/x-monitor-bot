@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class TelegramConfig(BaseModel):
@@ -21,11 +21,19 @@ class FetcherConfig(BaseModel):
     nitter_instance: str = "https://nitter.net"
 
 
+class TokenEntry(BaseModel):
+    """历史 auth token(带备注,方便下拉辨认)。"""
+
+    label: str = ""
+    token: str = ""
+
+
 class ScweetConfig(BaseModel):
     """Scweet (X GraphQL) source settings."""
 
     auth_token: str = ""
     proxy: str = ""
+    token_history: list[TokenEntry] = Field(default_factory=list)
 
 
 class StorageConfig(BaseModel):
