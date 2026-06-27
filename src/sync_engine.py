@@ -84,6 +84,8 @@ async def run_collect(
     send: Callable[[Post], Awaitable[Any]],
     *,
     max_retries: int = 3,
+    send_attempts: int = 3,
+    send_retry_delay: float = 1.0,
     sync_mode: str = "all",
     skip_retweets: bool = True,
 ) -> CollectResult:
@@ -122,17 +124,38 @@ async def run_collect(
             skipped_rt += 1
             logger.info("%s → 跳过(转推/引用)", prefix)
             continue
-        try:
-            await send(post)
+        # 立即重试:网络抖动等瞬时失败同一轮内重试 send_attempts 次(不等下一轮 poll)。
+        # 429/RetryAfter 已在 TelegramSink 内部处理;这里管的是 httpx 连接类瞬时错误。
+        last_exc: Exception | None = None
+        succeeded_at = 0
+        for attempt in range(1, send_attempts + 1):
+            try:
+                await send(post)
+                succeeded_at = attempt
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt < send_attempts:
+                    await asyncio.sleep(send_retry_delay)
+        if succeeded_at:
             entry.status = "sent"
             sent.append(post.post_id)
-            logger.info("%s → 已发", prefix)
-        except Exception as exc:
+            note = f"(第 {succeeded_at} 次尝试成功)" if succeeded_at > 1 else ""
+            logger.info("%s → 已发%s", prefix, note)
+        else:
             entry.status = mark_failed(entry, max_retries)
             entry.attempts += 1
             failed_send += 1
+            dest = "转 dead_letter" if entry.status == "dead" else "留 outbox 下轮重试"
             logger.warning(
-                "%s → 失败(%s, attempt %d): %s", prefix, entry.status, entry.attempts, exc
+                "%s → 发送 TG 失败,立即重试 %d 次仍败,%s(poll attempt %d/%d): %s",
+                prefix,
+                send_attempts,
+                dest,
+                entry.attempts,
+                max_retries,
+                last_exc,
             )
             if entry.status == "dead":
                 dead.append(post.post_id)
@@ -171,6 +194,8 @@ async def collect_account(
     account: str,
     *,
     max_retries: int = 3,
+    send_attempts: int = 3,
+    send_retry_delay: float = 1.0,
     now: datetime | None = None,
     sync_mode: str = "all",
     skip_retweets: bool = True,
@@ -199,17 +224,21 @@ async def collect_account(
         watermark,
         sink.post,
         max_retries=max_retries,
+        send_attempts=send_attempts,
+        send_retry_delay=send_retry_delay,
         sync_mode=sync_mode,
         skip_retweets=skip_retweets,
     )
 
     await store.replace_outbox(account, result.outbox)
     await store.set_watermark(account, result.watermark)
+    pending = sum(1 for e in result.outbox if not e.settled)
     logger.info(
-        "[collect] @%s 完成 sent=%d dead=%d → watermark=%s",
+        "[collect] @%s 完成 sent=%d dead=%d 待重试(outbox)=%d → watermark=%s",
         account,
         len(result.sent),
         len(result.dead),
+        pending,
         result.watermark.isoformat(),
     )
     ts_by_id = {p.post_id: p.timestamp for p in discovered}

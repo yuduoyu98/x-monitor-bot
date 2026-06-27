@@ -129,7 +129,7 @@ async def test_run_collect_does_not_resend_settled_post_above_watermark():
         _post("B", "2026-06-02T00:00:00+00:00"),
         _post("C", "2026-06-03T00:00:00+00:00"),
     ]
-    r1 = await run_collect(discovered, [], wm0, send_b_fails, max_retries=3)
+    r1 = await run_collect(discovered, [], wm0, send_b_fails, max_retries=3, send_retry_delay=0)
 
     assert sent == ["A", "C"]  # B 失败
     assert r1.watermark == datetime(2026, 6, 1, tzinfo=UTC)  # 卡在 A(B 阻断)
@@ -160,11 +160,17 @@ async def test_run_collect_marks_dead_after_max_retries_and_unblocks_watermark()
     async def always_fail(p: Post) -> None:
         raise RuntimeError("always")
 
-    r1 = await run_collect([post], [], datetime(2026, 5, 1, tzinfo=UTC), always_fail, max_retries=3)
+    r1 = await run_collect(
+        [post], [], datetime(2026, 5, 1, tzinfo=UTC), always_fail, max_retries=3, send_retry_delay=0
+    )
     assert r1.dead == []
-    r2 = await run_collect([post], r1.outbox, r1.watermark, always_fail, max_retries=3)
+    r2 = await run_collect(
+        [post], r1.outbox, r1.watermark, always_fail, max_retries=3, send_retry_delay=0
+    )
     assert r2.dead == []
-    r3 = await run_collect([post], r2.outbox, r2.watermark, always_fail, max_retries=3)
+    r3 = await run_collect(
+        [post], r2.outbox, r2.watermark, always_fail, max_retries=3, send_retry_delay=0
+    )
     assert r3.dead == ["X"]
     assert r3.watermark == datetime(2026, 6, 1, tzinfo=UTC)  # dead 算 settled → 越过
 
@@ -217,6 +223,69 @@ async def test_run_collect_sends_retweet_when_skip_disabled():
     )
 
     assert sent == ["RT"]
+
+
+class _FlakySink:
+    """前 fail_first 次 post 抛异常,之后成功;记录调用次数(测立即重试)。"""
+
+    def __init__(self, fail_first: int) -> None:
+        self.fail_first = fail_first
+        self.calls = 0
+        self.sent: list[str] = []
+
+    async def post(self, post: Post):
+        self.calls += 1
+        if self.calls <= self.fail_first:
+            raise RuntimeError(f"transient #{self.calls}")
+        self.sent.append(post.post_id)
+
+
+async def test_run_collect_retries_send_immediately_then_succeeds():
+    """TG 发送失败 → 同一轮立即重试,第 3 次成功 → 视为已发(不等下一轮 poll)。"""
+    post = _post("A", "2026-06-01T00:00:00+00:00")
+    sink = _FlakySink(fail_first=2)  # 第 1、2 次失败,第 3 次成功
+
+    async def send(p: Post) -> None:
+        await sink.post(p)
+
+    result = await run_collect(
+        [post],
+        [],
+        datetime(2026, 5, 1, tzinfo=UTC),
+        send,
+        max_retries=3,
+        send_attempts=3,
+        send_retry_delay=0,
+    )
+
+    assert sink.calls == 3
+    assert result.sent == ["A"]
+    assert result.outbox == []
+    assert result.watermark == datetime(2026, 6, 1, tzinfo=UTC)
+
+
+async def test_run_collect_immediate_retry_exhausted_marks_failed_not_dead():
+    """立即重试全败 → 仍 failed(留 outbox 下轮),没到 max_retries 不进 dead。"""
+    post = _post("A", "2026-06-01T00:00:00+00:00")
+    sink = _FlakySink(fail_first=99)  # 永远失败
+
+    async def send(p: Post) -> None:
+        await sink.post(p)
+
+    result = await run_collect(
+        [post],
+        [],
+        datetime(2026, 5, 1, tzinfo=UTC),
+        send,
+        max_retries=3,
+        send_attempts=3,
+        send_retry_delay=0,
+    )
+
+    assert sink.calls == 3  # 立即重试了 3 次
+    assert result.sent == []
+    assert result.dead == []  # 没到 max_retries → 不 dead
+    assert {e.post_id: (e.status, e.attempts) for e in result.outbox} == {"A": ("failed", 1)}
 
 
 # --- collect_account:Store ↔ run_collect ↔ Source/Sink 的桥接 ---
@@ -300,7 +369,7 @@ async def test_collect_account_records_dead_letter(db):
     sink = FakeSink(fail_on=["X"])
 
     for _ in range(3):
-        await collect_account(db, src, sink, "alice", max_retries=3)
+        await collect_account(db, src, sink, "alice", max_retries=3, send_retry_delay=0)
 
     dl = await db.get_dead_letter("alice")
     assert [d["post_id"] for d in dl] == ["X"]
