@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 CREATE TABLE IF NOT EXISTS groups (
     name TEXT PRIMARY KEY,
     enabled INTEGER NOT NULL DEFAULT 1,
-    sort_order INTEGER NOT NULL DEFAULT 0
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    parent_name TEXT
 );
 CREATE TABLE IF NOT EXISTS outbox (
     account_id TEXT NOT NULL,
@@ -70,9 +71,11 @@ class Database:
         self._conn = await aiosqlite.connect(str(self._db_path))
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA_SQL)
-        # 迁移:旧 DB 可能没有 group_name 列
+        # 迁移:旧 DB 可能没有 group_name / parent_name 列
         with contextlib.suppress(Exception):
             await self._conn.execute("ALTER TABLE subscriptions ADD COLUMN group_name TEXT")
+        with contextlib.suppress(Exception):
+            await self._conn.execute("ALTER TABLE groups ADD COLUMN parent_name TEXT")
         await self._conn.commit()
         logger.info("Database initialized at %s", self._db_path)
 
@@ -124,10 +127,24 @@ class Database:
         await self._conn.execute("DELETE FROM subscriptions WHERE account_id = ?", (account_id,))
         await self._conn.commit()
 
+    async def set_group(self, account_id: str, group_name: str | None) -> None:
+        """只改订阅的 group_name(移动分组),不动其它配置/watermark。"""
+        await self._conn.execute(
+            "UPDATE subscriptions SET group_name = ? WHERE account_id = ?",
+            (group_name, account_id),
+        )
+        await self._conn.commit()
+
     async def toggle_enabled(self, account_id: str) -> bool:
-        """翻转订阅 enabled,返回新状态。"""
+        """翻转订阅 enabled,返回新状态。关掉时顺手清 running(不再"采集中")。"""
         await self._conn.execute(
             "UPDATE subscriptions SET enabled = 1 - enabled WHERE account_id = ?",
+            (account_id,),
+        )
+        # 刚被关掉(enabled=0)→ 清 running / running_since
+        await self._conn.execute(
+            "UPDATE subscriptions SET running = 0, running_since = NULL "
+            "WHERE account_id = ? AND enabled = 0",
             (account_id,),
         )
         await self._conn.commit()
@@ -139,11 +156,14 @@ class Database:
 
     # --- groups ---
 
-    async def upsert_group(self, name: str, sort_order: int = 0) -> None:
+    async def upsert_group(
+        self, name: str, parent_name: str | None = None, sort_order: int = 0
+    ) -> None:
         await self._conn.execute(
-            "INSERT INTO groups (name, sort_order) VALUES (?, ?) "
-            "ON CONFLICT(name) DO UPDATE SET sort_order=excluded.sort_order",
-            (name, sort_order),
+            "INSERT INTO groups (name, parent_name, sort_order) VALUES (?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET "
+            "sort_order=excluded.sort_order, parent_name=excluded.parent_name",
+            (name, parent_name, sort_order),
         )
         await self._conn.commit()
 
@@ -159,11 +179,49 @@ class Database:
         row = await cursor.fetchone()
         return bool(row[0]) if row else False
 
-    async def delete_group(self, name: str) -> None:
-        """删组;组内订阅的 group_name 置 NULL(变未分组)。"""
+    async def toggle_subgroup(self, name: str) -> bool:
+        """小组开关(≠ 顶级):翻转小组 enabled 并同步组内账号 enabled。
+        开 → 组内账号全开;关 → 全关 + 清 running。返回新状态。"""
+        cur = await self._conn.execute("SELECT enabled FROM groups WHERE name = ?", (name,))
+        row = await cur.fetchone()
+        if row is None:
+            return False
+        new = 0 if row["enabled"] else 1
+        await self._conn.execute("UPDATE groups SET enabled = ? WHERE name = ?", (new, name))
         await self._conn.execute(
-            "UPDATE subscriptions SET group_name = NULL WHERE group_name = ?", (name,)
+            "UPDATE subscriptions SET enabled = ? WHERE group_name = ?", (new, name)
         )
+        if new == 0:
+            await self._conn.execute(
+                "UPDATE subscriptions SET running = 0, running_since = NULL WHERE group_name = ?",
+                (name,),
+            )
+        await self._conn.commit()
+        return bool(new)
+
+    async def delete_group(self, name: str) -> None:
+        """删组。
+        - 顶级分组:其下全部订阅(直挂 + 各小组里)→ 未分组;小组提升为顶级(parent_name 清空)。
+        - 小组:该小组订阅 → 未分组。
+        """
+        cur = await self._conn.execute("SELECT parent_name FROM groups WHERE name = ?", (name,))
+        row = await cur.fetchone()
+        is_top = row is None or row["parent_name"] is None
+        if is_top:
+            cur = await self._conn.execute("SELECT name FROM groups WHERE parent_name = ?", (name,))
+            names = [name] + [r["name"] for r in await cur.fetchall()]
+            placeholders = ",".join("?" * len(names))
+            await self._conn.execute(
+                f"UPDATE subscriptions SET group_name = NULL WHERE group_name IN ({placeholders})",
+                names,
+            )
+            await self._conn.execute(
+                "UPDATE groups SET parent_name = NULL WHERE parent_name = ?", (name,)
+            )
+        else:
+            await self._conn.execute(
+                "UPDATE subscriptions SET group_name = NULL WHERE group_name = ?", (name,)
+            )
         await self._conn.execute("DELETE FROM groups WHERE name = ?", (name,))
         await self._conn.commit()
 
@@ -171,6 +229,10 @@ class Database:
         await self._conn.execute("UPDATE groups SET name = ? WHERE name = ?", (new, old))
         await self._conn.execute(
             "UPDATE subscriptions SET group_name = ? WHERE group_name = ?", (new, old)
+        )
+        # 若是顶级分组,其下小组的 parent_name 跟着改(重命名小组时此句无匹配,安全)
+        await self._conn.execute(
+            "UPDATE groups SET parent_name = ? WHERE parent_name = ?", (new, old)
         )
         await self._conn.commit()
 
@@ -247,11 +309,13 @@ class Database:
     # --- 调度(SP2-d)---
 
     async def get_enabled_subscriptions(self) -> list[dict]:
-        """返回个人 enabled=1 且(无组 或 组 enabled=1)的订阅。"""
+        """返回 enabled=1 且所属分组(及其父分组)enabled=1 的订阅。"""
         cursor = await self._conn.execute(
             "SELECT s.* FROM subscriptions s "
             "LEFT JOIN groups g ON s.group_name = g.name "
-            "WHERE s.enabled = 1 AND (s.group_name IS NULL OR g.enabled = 1)"
+            "LEFT JOIN groups pg ON g.parent_name = pg.name "
+            "WHERE s.enabled = 1 AND (s.group_name IS NULL OR "
+            "(g.enabled = 1 AND (g.parent_name IS NULL OR pg.enabled = 1)))"
         )
         return [dict(row) for row in await cursor.fetchall()]
 
@@ -270,4 +334,9 @@ class Database:
             "UPDATE subscriptions SET running = ?, running_since = ? WHERE account_id = ?",
             (1 if running else 0, ts, account_id),
         )
+        await self._conn.commit()
+
+    async def clear_all_running(self) -> None:
+        """清零所有订阅的 running 标记(关闭应用时清理"采集中"孤儿状态)。"""
+        await self._conn.execute("UPDATE subscriptions SET running = 0, running_since = NULL")
         await self._conn.commit()
