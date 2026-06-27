@@ -78,6 +78,12 @@ def parse_tweet(raw_tweet: dict) -> DiscoveredTweet | None:
     except ValueError:
         timestamp = datetime.now(UTC)
     raw = raw_tweet.get("raw") or {}
+    # Scweet 的 raw 是「未解包」的 tweet_result_raw(api_engine.py: raw=tweet_result_raw)。
+    # TweetWithVisibilityResults(回复受限/可见性,如本例 @DeadShe_ 限定回复的推)的 legacy
+    # 嵌在 raw["tweet"]["legacy"],需先解包(对齐 Scweet 自己取 legacy 的方式),
+    # 否则媒体/转推判定全空 → media=0 被 media_only 误跳过(真实有图也漏采)。
+    if isinstance(raw.get("tweet"), dict):
+        raw = raw["tweet"]
     legacy = raw.get("legacy") or {}
     user = raw_tweet.get("user") or {}
     return DiscoveredTweet(

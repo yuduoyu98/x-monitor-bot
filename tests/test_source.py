@@ -19,6 +19,7 @@ from src.source.base import (
     filter_newer,
     media_cache_path,
 )
+from src.source.scweet import parse_tweet
 
 
 def _tweet(post_id: str, iso_ts: str) -> DiscoveredTweet:
@@ -136,6 +137,61 @@ def test_source_protocol_is_structural():
         async def close(self): ...
 
     assert isinstance(FakeSource(), Source)
+
+
+# --- parse_tweet:Scweet raw → DiscoveredTweet(纯函数,单测) ---
+# Scweet 把 raw 设成「未解包」的 tweet_result_raw(api_engine.py:2543);
+# TweetWithVisibilityResults(回复受限/可见性)的 legacy 嵌在 raw["tweet"]["legacy"],
+# parse_tweet 必须先解包,否则媒体/转推判定全空 → media=0 被 media_only 误跳过。
+
+
+def _photo_media(url: str = "https://pbs.twimg.com/media/abc.jpg?name=orig") -> dict:
+    return {"type": "photo", "media_url_https": url}
+
+
+def test_parse_tweet_detects_photo_in_visibility_wrapped_tweet():
+    """TweetWithVisibilityResults:legacy 在 raw.tweet.legacy → 仍要解出媒体(本次 bug 回归)。"""
+    raw_tweet = {
+        "tweet_id": "2068697713781428482",
+        "timestamp": "Sun Jun 21 06:09:00 +0000 2026",
+        "text": "私人电报已更新",
+        "user": {"name": "DeadShe"},
+        "raw": {  # = Scweet 的 tweet_result_raw(未解包)
+            "__typename": "TweetWithVisibilityResults",
+            "rest_id": "2068697713781428482",
+            "tweet": {
+                "legacy": {"extended_entities": {"media": [_photo_media()]}},
+            },
+        },
+    }
+    dt = parse_tweet(raw_tweet)
+    assert dt is not None
+    assert dt.is_retweet is False
+    assert len(dt.media) == 1
+    assert dt.media[0].type == "photo"
+    assert dt.media[0].url.startswith("https://pbs.twimg.com/media/abc.jpg")
+
+
+def test_parse_tweet_detects_photo_in_normal_tweet():
+    """普通 Tweet:legacy 在 raw.legacy → 解出媒体(解包逻辑不能破坏正常路径)。"""
+    raw_tweet = {
+        "tweet_id": "1",
+        "timestamp": "Sun Jun 21 06:09:00 +0000 2026",
+        "text": "hi",
+        "user": {},
+        "raw": {
+            "__typename": "Tweet",
+            "legacy": {
+                "extended_entities": {
+                    "media": [_photo_media("https://pbs.twimg.com/media/zzz.jpg")]
+                }
+            },
+        },
+    }
+    dt = parse_tweet(raw_tweet)
+    assert dt is not None
+    assert len(dt.media) == 1
+    assert dt.media[0].url.startswith("https://pbs.twimg.com/media/zzz.jpg")
 
 
 # --- ScweetSource 活体测试(外部系统:按策略 live,不 mock) ---
